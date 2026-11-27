@@ -18,6 +18,8 @@ import com.belopus.life.engine.SimStats;
 import com.belopus.life.engine.Symmetry;
 import com.belopus.life.engine.Topology;
 
+import java.util.ArrayList;
+
 public class LifeCanvasView extends View {
 
     public enum ToolMode {
@@ -66,9 +68,21 @@ public class LifeCanvasView extends View {
 
     // Drawing state
     private boolean singleStrokeActive = false;
+    private boolean strokeConfirmed = false;
     private boolean undoRecordedForStroke = false;
     private int lastDrawCellX, lastDrawCellY;
     private boolean toggleTargetAlive = true;
+    private long strokeDownTime = 0L;
+    private float strokeDownScreenX, strokeDownScreenY;
+    private final ArrayList<int[]> pendingStrokeCells = new ArrayList<>();
+    private final Runnable confirmStrokeRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (singleStrokeActive && !multiTouchActive && !strokeConfirmed) {
+                confirmAndFlushPendingStroke();
+            }
+        }
+    };
 
     // Shape drag preview state
     private boolean shapeDragging = false;
@@ -79,6 +93,8 @@ public class LifeCanvasView extends View {
     private boolean hasSelection = false;
     private boolean selectingDrag = false;
     private int selX0, selY0, selX1, selY1;
+    private boolean prevHasSelection = false;
+    private int prevSelX0, prevSelY0, prevSelX1, prevSelY1;
 
     // Stamp state
     private CellRegion stampRegion = null;
@@ -139,6 +155,8 @@ public class LifeCanvasView extends View {
             public boolean onScaleBegin(ScaleGestureDetector detector) {
                 lastFocusX = detector.getFocusX();
                 lastFocusY = detector.getFocusY();
+                lastPanX = lastFocusX;
+                lastPanY = lastFocusY;
                 return true;
             }
 
@@ -164,10 +182,13 @@ public class LifeCanvasView extends View {
 
                 lastFocusX = fx;
                 lastFocusY = fy;
+                lastPanX = fx;
+                lastPanY = fy;
                 invalidate();
                 return true;
             }
         });
+        scaleDetector.setQuickScaleEnabled(false);
     }
 
     public void attachEngine(LifeEngine engine) {
@@ -393,6 +414,80 @@ public class LifeCanvasView extends View {
         return (int) Math.floor(camY + (sy - getHeight() * 0.5f) / cellPx);
     }
 
+    private void confirmAndFlushPendingStroke() {
+        removeCallbacks(confirmStrokeRunnable);
+        if (engine == null || pendingStrokeCells.isEmpty()) {
+            strokeConfirmed = true;
+            return;
+        }
+        strokeConfirmed = true;
+        int[] first = pendingStrokeCells.get(0);
+        if (toolMode == ToolMode.TOGGLE) {
+            toggleTargetAlive = !engine.isAlive(first[0], first[1]);
+        }
+        boolean alive = (toolMode == ToolMode.DRAW) || (toolMode == ToolMode.TOGGLE && toggleTargetAlive);
+        if (!undoRecordedForStroke) {
+            engine.pushUndo();
+            undoRecordedForStroke = true;
+        }
+        engine.drawCellWithSymmetry(first[0], first[1], alive, symmetry);
+        int prevX = first[0];
+        int prevY = first[1];
+        for (int i = 1; i < pendingStrokeCells.size(); i++) {
+            int[] pt = pendingStrokeCells.get(i);
+            if (pt[0] != prevX || pt[1] != prevY) {
+                engine.drawLineWithSymmetry(prevX, prevY, pt[0], pt[1], alive, symmetry);
+                prevX = pt[0];
+                prevY = pt[1];
+            }
+        }
+        lastDrawCellX = prevX;
+        lastDrawCellY = prevY;
+        pendingStrokeCells.clear();
+        engine.notifyManualEditComplete(true);
+        if (soundEngine != null) soundEngine.playDrawPop(alive);
+        if (listener != null) listener.onCanvasEdited();
+        invalidate();
+    }
+
+    private void cancelPendingAndActiveEdits() {
+        removeCallbacks(confirmStrokeRunnable);
+        boolean shouldRevertDraw = undoRecordedForStroke && engine != null;
+        pendingStrokeCells.clear();
+        singleStrokeActive = false;
+        strokeConfirmed = false;
+        undoRecordedForStroke = false;
+        shapeDragging = false;
+        if (shouldRevertDraw) {
+            if (engine.undo()) {
+                engine.notifyManualEditComplete(true);
+                if (listener != null) listener.onCanvasEdited();
+            }
+            invalidate();
+        }
+        if (selectingDrag) {
+            selectingDrag = false;
+            hasSelection = prevHasSelection;
+            selX0 = prevSelX0;
+            selY0 = prevSelY0;
+            selX1 = prevSelX1;
+            selY1 = prevSelY1;
+            if (listener != null) {
+                listener.onSelectionChanged(hasSelection,
+                        hasSelection ? Math.abs(selX1 - selX0) + 1 : 0,
+                        hasSelection ? Math.abs(selY1 - selY0) + 1 : 0);
+            }
+            invalidate();
+        }
+        if (stampDragging) {
+            stampDragging = false;
+            stampX = stampDragStartCellX;
+            stampY = stampDragStartCellY;
+            if (listener != null) listener.onStampMoved(stampX, stampY);
+            invalidate();
+        }
+    }
+
     @Override
     public boolean onTouchEvent(MotionEvent event) {
         if (engine == null) return true;
@@ -404,14 +499,30 @@ public class LifeCanvasView extends View {
         if (ptrCount >= 2) {
             if (!multiTouchActive) {
                 multiTouchActive = true;
-                singleStrokeActive = false;
-                shapeDragging = false;
-                selectingDrag = false;
-                stampDragging = false;
+                cancelPendingAndActiveEdits();
                 lastPanX = (event.getX(0) + event.getX(1)) * 0.5f;
                 lastPanY = (event.getY(0) + event.getY(1)) * 0.5f;
             }
-            if (action == MotionEvent.ACTION_MOVE && !scaleDetector.isInProgress()) {
+            if (action == MotionEvent.ACTION_POINTER_DOWN) {
+                lastPanX = (event.getX(0) + event.getX(1)) * 0.5f;
+                lastPanY = (event.getY(0) + event.getY(1)) * 0.5f;
+            } else if (action == MotionEvent.ACTION_POINTER_UP) {
+                // Keep remaining pointer(s) midpoint seamless for continued pan
+                int upIdx = event.getActionIndex();
+                float sx = 0f, sy = 0f;
+                int rem = 0;
+                for (int i = 0; i < ptrCount; i++) {
+                    if (i != upIdx) {
+                        sx += event.getX(i);
+                        sy += event.getY(i);
+                        rem++;
+                    }
+                }
+                if (rem > 0) {
+                    lastPanX = sx / rem;
+                    lastPanY = sy / rem;
+                }
+            } else if (action == MotionEvent.ACTION_MOVE && !scaleDetector.isInProgress()) {
                 float mx = (event.getX(0) + event.getX(1)) * 0.5f;
                 float my = (event.getY(0) + event.getY(1)) * 0.5f;
                 camX -= (mx - lastPanX) / cellPx;
@@ -427,6 +538,8 @@ public class LifeCanvasView extends View {
         switch (action) {
             case MotionEvent.ACTION_DOWN: {
                 multiTouchActive = false;
+                removeCallbacks(confirmStrokeRunnable);
+                pendingStrokeCells.clear();
                 float x = event.getX();
                 float y = event.getY();
                 int cx = screenToCellX(x);
@@ -436,22 +549,19 @@ public class LifeCanvasView extends View {
                     lastPanX = x;
                     lastPanY = y;
                     singleStrokeActive = true;
+                    strokeConfirmed = true;
                 } else if (toolMode == ToolMode.DRAW || toolMode == ToolMode.ERASE || toolMode == ToolMode.TOGGLE) {
+                    // Defer committing stroke for 115ms so a 2-finger pinch/pan never leaves stray dots!
                     singleStrokeActive = true;
+                    strokeConfirmed = false;
                     undoRecordedForStroke = false;
+                    strokeDownTime = event.getEventTime();
+                    strokeDownScreenX = x;
+                    strokeDownScreenY = y;
                     lastDrawCellX = cx;
                     lastDrawCellY = cy;
-                    if (toolMode == ToolMode.TOGGLE) {
-                        toggleTargetAlive = !engine.isAlive(cx, cy);
-                    }
-                    boolean alive = (toolMode == ToolMode.DRAW) || (toolMode == ToolMode.TOGGLE && toggleTargetAlive);
-                    engine.pushUndo();
-                    undoRecordedForStroke = true;
-                    engine.drawCellWithSymmetry(cx, cy, alive, symmetry);
-                    engine.notifyManualEditComplete(true);
-                    if (soundEngine != null) soundEngine.playDrawPop(alive);
-                    if (listener != null) listener.onCanvasEdited();
-                    invalidate();
+                    pendingStrokeCells.add(new int[]{cx, cy});
+                    postDelayed(confirmStrokeRunnable, 150L);
                 } else if (toolMode == ToolMode.LINE || toolMode == ToolMode.RECT_OUTLINE
                         || toolMode == ToolMode.RECT_FILL || toolMode == ToolMode.CIRCLE_OUTLINE
                         || toolMode == ToolMode.CIRCLE_FILL) {
@@ -460,6 +570,11 @@ public class LifeCanvasView extends View {
                     shapeStartY = shapeEndY = cy;
                     invalidate();
                 } else if (toolMode == ToolMode.SELECT) {
+                    prevHasSelection = hasSelection;
+                    prevSelX0 = selX0;
+                    prevSelY0 = selY0;
+                    prevSelX1 = selX1;
+                    prevSelY1 = selY1;
                     selectingDrag = true;
                     hasSelection = true;
                     selX0 = selX1 = cx;
@@ -477,9 +592,17 @@ public class LifeCanvasView extends View {
             }
 
             case MotionEvent.ACTION_MOVE: {
-                if (multiTouchActive) break;
                 float x = event.getX();
                 float y = event.getY();
+                if (multiTouchActive) {
+                    // Remaining finger after a 2-finger pinch/pan continues panning cleanly without drawing
+                    camX -= (x - lastPanX) / cellPx;
+                    camY -= (y - lastPanY) / cellPx;
+                    lastPanX = x;
+                    lastPanY = y;
+                    invalidate();
+                    break;
+                }
                 int cx = screenToCellX(x);
                 int cy = screenToCellY(y);
 
@@ -491,7 +614,18 @@ public class LifeCanvasView extends View {
                     invalidate();
                 } else if ((toolMode == ToolMode.DRAW || toolMode == ToolMode.ERASE || toolMode == ToolMode.TOGGLE)
                         && singleStrokeActive) {
-                    if (cx != lastDrawCellX || cy != lastDrawCellY) {
+                    if (!strokeConfirmed) {
+                        if (cx != lastDrawCellX || cy != lastDrawCellY) {
+                            pendingStrokeCells.add(new int[]{cx, cy});
+                            lastDrawCellX = cx;
+                            lastDrawCellY = cy;
+                        }
+                        long elapsed = event.getEventTime() - strokeDownTime;
+                        float moveDist = (float) Math.hypot(x - strokeDownScreenX, y - strokeDownScreenY);
+                        if (elapsed >= 150L || (elapsed >= 85L && moveDist >= UiHelper.dp(getContext(), 12))) {
+                            confirmAndFlushPendingStroke();
+                        }
+                    } else if (cx != lastDrawCellX || cy != lastDrawCellY) {
                         if (!undoRecordedForStroke) {
                             engine.pushUndo();
                             undoRecordedForStroke = true;
@@ -537,8 +671,12 @@ public class LifeCanvasView extends View {
 
             case MotionEvent.ACTION_UP:
             case MotionEvent.ACTION_CANCEL: {
-                if (!multiTouchActive) {
-                    if (shapeDragging) {
+                removeCallbacks(confirmStrokeRunnable);
+                if (!multiTouchActive && action == MotionEvent.ACTION_UP) {
+                    if (singleStrokeActive && !strokeConfirmed
+                            && (toolMode == ToolMode.DRAW || toolMode == ToolMode.ERASE || toolMode == ToolMode.TOGGLE)) {
+                        confirmAndFlushPendingStroke();
+                    } else if (shapeDragging) {
                         shapeDragging = false;
                         commitShape();
                     } else if (selectingDrag) {
@@ -558,8 +696,12 @@ public class LifeCanvasView extends View {
                             invalidate();
                         }
                     }
+                } else {
+                    cancelPendingAndActiveEdits();
                 }
+                pendingStrokeCells.clear();
                 singleStrokeActive = false;
+                strokeConfirmed = false;
                 undoRecordedForStroke = false;
                 multiTouchActive = false;
                 break;

@@ -25,6 +25,7 @@ public class LifeEngineTest {
         testUndoRedoAndGen0();
         testMethuselahMilestones();
         testAllLibraryPatterns();
+        testPureLogicCircuits();
 
         System.out.println("\n=== Engine Test Summary: " + passed + " passed, " + failed + " failed ===");
         if (failed > 0) System.exit(1);
@@ -177,11 +178,38 @@ public class LifeEngineTest {
             } else if (entry.id.equals("gosper_gun") || entry.id.equals("simkin_gun")
                     || entry.id.equals("switch_engine_glider") || entry.id.equals("switch_engine_block")
                     || entry.id.equals("line_infinite") || entry.id.equals("one_row_infinite")
-                    || entry.id.equals("highlife_replicator") || entry.id.equals("max_spacefiller")) {
+                    || entry.id.equals("highlife_replicator") || entry.id.equals("max_spacefiller")
+                    || entry.id.equals("ak94") || entry.id.equals("b52_bomber") || entry.id.equals("p52_gun")) {
                 long initPop = reg.liveCount();
                 e.stepN(300);
                 check(e.getStats().liveCount > initPop + 10,
                         "Infinite growth verified: " + entry.id + " init=" + initPop + " after300=" + e.getStats().liveCount);
+            }
+        }
+    }
+
+    private static void testPureLogicCircuits() {
+        check(PatternLibrary.getAll().size() >= 88,
+                "PatternLibrary expanded to >= 88 patterns (got " + PatternLibrary.getAll().size() + ")");
+
+        for (PatternLibrary.PatternEntry entry : PatternLibrary.getGrouped().get(PatternLibrary.Category.CIRCUITS)) {
+            CellRegion reg = entry.getRegion();
+            LifeEngine e = new LifeEngine();
+            e.setRule(entry.getRule());
+            e.pasteRegion(reg, 0, 0, true, false);
+            e.stepN(400);
+            SimStats st = e.getStats();
+            if (entry.id.equals("stargate_p60")) {
+                boolean emittedLwssRight = st.liveCount > 900 && st.minY >= 0 && st.maxY <= reg.height + 5
+                        && st.maxX > reg.width + 50;
+                check(emittedLwssRight, "Star Gate emits LWSS rightward cleanly: pop=" + st.liveCount
+                        + " box=[" + st.minX + ".." + st.maxX + "," + st.minY + ".." + st.maxY + "]");
+            } else {
+                boolean bounded = st.liveCount > 20
+                        && st.minX >= -10 && st.maxX <= reg.width + 10
+                        && st.minY >= -10 && st.maxY <= reg.height + 10;
+                check(bounded, "Pure Life circuit bounded after 400 gens: " + entry.id
+                        + " pop=" + st.liveCount + " box=[" + st.minX + ".." + st.maxX + "," + st.minY + ".." + st.maxY + "]");
             }
         }
     }
